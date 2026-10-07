@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""kingmaker: the Hermes Value Index (HVI) ranking. One-shot, deterministic, no LLM scoring at runtime.
+"""kingmaker: rank the Hermes Index by measured $/task and keep the main model on
+the best in-budget pick. One-shot, deterministic, no LLM scoring at runtime.
 
 Fetches the Hermes Index leaderboard (portal.nousresearch.com/bench), parses the
 server-rendered leaderboard table, appends to ledger, and then follows the saved
@@ -23,7 +24,7 @@ Selection policy: among nous-catalog models whose Hermes-measured average cost
 per task is STRICTLY UNDER the cap (--cap, default $0.30/task), pick the highest
 Hermes Index score. NOT the score/$ sort leader. Usable = exact provider model id
 resolved from the current nous catalog via the curated benchmark-name mapping
-(HVI_NOUS_MODEL_IDS); unknown mappings are never guessed. Provisional (*)
+(NOUS_MODEL_IDS); unknown mappings are never guessed. Provisional (*)
 leaderboard entries never qualify. Missing/non-finite values cannot qualify a
 candidate.
 
@@ -46,8 +47,8 @@ Usage: python3 kingmaker-job.py [--cap 0.30|none] [--out snapshot.json] [--quiet
 This install's answers (budget, mode, cadence) live in answers.json beside
 SKILL.md; the constants below are the shipped defaults. The only Hermes setting
 this script writes is the main model, through `hermes config set model.default`.
-Runtime state (latest.json, ledger.jsonl, hvi_apply_receipt.json,
-hvi_apply_state.json) goes to $HERMES_HOME/data/kingmaker/, never inside the
+Runtime state (latest.json, apply_state.json, apply_receipt.json, ledger.jsonl)
+goes to $HERMES_HOME/data/kingmaker/, never inside the
 skill.
 
 HERMES_HOME is the only environment variable read (the standard profile root);
@@ -77,8 +78,8 @@ HERMES_HOME = os.environ.get("HERMES_HOME") or os.path.join(
 # would be silently lost.
 DATA_DIR = os.path.join(HERMES_HOME, "data", "kingmaker")
 LEDGER = os.path.join(DATA_DIR, "ledger.jsonl")
-STATE_FILE = os.path.join(DATA_DIR, "hvi_apply_state.json")
-RECEIPT_FILE = os.path.join(DATA_DIR, "hvi_apply_receipt.json")
+STATE_FILE = os.path.join(DATA_DIR, "apply_state.json")
+RECEIPT_FILE = os.path.join(DATA_DIR, "apply_receipt.json")
 KEEP_RUNS = 7
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
 
@@ -131,7 +132,7 @@ ANCHOR_TOLERANCE = 5.0
 # unambiguous nous counterpart are deliberately absent and never guessed:
 #   "Qwen 3.8 Max"  catalog only carries qwen3.8-max-0902 / qwen3.8-max-prime
 #   "Hy4"           catalog only carries tencent/hy4-preview
-HVI_NOUS_MODEL_IDS = {
+NOUS_MODEL_IDS = {
     "Claude Opus 5.5": "anthropic/claude-opus-5.5",
     "Claude Sonnet 5.5": "anthropic/claude-sonnet-5.5",
     "GPT 6 Astra": "openai/gpt-6-astra",
@@ -162,7 +163,7 @@ def _configure_logging():
     root = logging.getLogger()
     if not root.handlers:
         logging.basicConfig(level=logging.INFO,
-                            format="hvi: %(levelname)s %(message)s")
+                            format="kingmaker: %(levelname)s %(message)s")
 
 
 def fetch():
@@ -331,7 +332,7 @@ def attach_provider_identity(rows, catalog):
     benchmark-name mapping. Unknown mappings stay null, never guessed."""
     ids = set(catalog.get("ids") or [])
     for r in rows:
-        mid = HVI_NOUS_MODEL_IDS.get(r.get("name") or "")
+        mid = NOUS_MODEL_IDS.get(r.get("name") or "")
         if not mid or mid not in ids:
             r["provider_model_id"] = None
             r["eligibility_issue"] = ("unmapped benchmark identity" if not mid
@@ -341,7 +342,7 @@ def attach_provider_identity(rows, catalog):
     return rows
 
 
-def hvi_leader(rows, usable_ids=None, exclude=None):
+def pick_crown(rows, usable_ids=None, exclude=None):
     """Selection policy: the smartest model under the cost cap (max Hermes Index
     among in-cap, non-provisional rows), restricted to ACTUAL usable provider
     models. That is THE crown. It is NOT the score/$ sort leader (that is just a
@@ -526,8 +527,9 @@ def build_snapshot(rows, crown, cap):
 
 # --------------------------------------------------------------- apply state
 def load_state():
-    """Apply state. An unreadable file starts fresh, and says so: a silent reset
-    would drop candidate cooldowns without anyone noticing."""
+    """Apply state. A missing file is just a fresh install and stays silent; an
+    unusable one starts fresh AND says so, because a silent reset would drop
+    candidate cooldowns without anyone noticing."""
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
             s = json.load(f)
@@ -535,8 +537,12 @@ def load_state():
             s.setdefault("last_good", None)
             s.setdefault("failed", {})
             return s
-    except (OSError, UnicodeDecodeError, ValueError):
-        logger.warning("apply state unreadable at %s; starting fresh", STATE_FILE)
+        detail = "not a JSON object"
+    except FileNotFoundError:
+        return {"last_good": None, "failed": {}}
+    except (OSError, UnicodeDecodeError, ValueError) as e:
+        detail = type(e).__name__
+    logger.warning("apply state unusable at %s (%s); starting fresh", STATE_FILE, detail)
     return {"last_good": None, "failed": {}}
 
 
@@ -605,7 +611,7 @@ PROBE_LOADER = (
     "root = os.path.join(os.environ.get('HERMES_HOME', ''), 'hermes-agent')\n"
     "if os.path.isdir(root) and root not in sys.path:\n"
     "    sys.path.insert(0, root)\n"
-    "spec = importlib.util.spec_from_file_location('hvi_probe_mod', sys.argv[1])\n"
+    "spec = importlib.util.spec_from_file_location('kingmaker_probe_mod', sys.argv[1])\n"
     "mod = importlib.util.module_from_spec(spec)\n"
     "spec.loader.exec_module(mod)\n"
     "{'catalog': mod.probe_catalog_main, 'smoke': mod.probe_smoke_main,\n"
@@ -975,12 +981,12 @@ def apply_main(snap, catalog):
         return code, status, lines
 
     if baseline.get('errors') or not cur or prov != 'nous':
-        return finish('failed_config', 5, ['HVI blocked: configured provider/config readback is not qualified nous; no write.'])
+        return finish('failed_config', 5, ['kingmaker blocked: configured provider/config readback is not qualified nous; no write.'])
 
     if snap.get('unresolved_candidates'):
         first = snap['unresolved_candidates'][0]
         return finish('failed_identity', 3, [
-            'HVI blocked: stronger candidate %s has %s; no config write.' % (first['name'], first['reason'])])
+            'kingmaker blocked: stronger candidate %s has %s; no config write.' % (first['name'], first['reason'])])
 
     if chosen == cur:
         unpinned = [j for j in (baseline.get("jobs") or [])
@@ -990,7 +996,7 @@ def apply_main(snap, catalog):
             unpinned[0].get("model") if unpinned else None)
         rec["verify"]["ok"] = all(j.get('model') == cur for j in unpinned)
         if not rec['verify']['ok']:
-            return finish('failed_verify', 5, ['HVI blocked: unchanged main differs from cron resolution; no write.'])
+            return finish('failed_verify', 5, ['kingmaker blocked: unchanged main differs from cron resolution; no write.'])
         return finish("unchanged", 0, [])          # silent: nothing changed
 
     smoke = compat_smoke(chosen, prov or "nous")
@@ -1237,7 +1243,7 @@ def main(argv=None, page_text=None):
     catalog = load_nous_catalog()
     attach_provider_identity(rows, catalog)
     state = load_state()
-    crown = hvi_leader(rows, usable_ids=set(catalog.get("ids") or []),
+    crown = pick_crown(rows, usable_ids=set(catalog.get("ids") or []),
                        exclude=cooldown_excluded(state))
     snap = build_snapshot(rows, crown, cap)
     atomic_write_json(a.out, snap)
