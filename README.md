@@ -39,7 +39,7 @@ nous-routed model whose measured average `$/task` is **strictly under** your bud
   surfaced, rather than being guessed at.
 - In apply mode the candidate is smoke-tested (chat, tool calling, structured output),
   applied with `hermes config set model.default`, then verified against the effective
-  config and the next job's scheduler resolution — rolled back if either disagrees.
+  config — rolled back if it disagrees.
 - Rate limits are transient: retried with backoff, then deferred.
 
 Empty output means there was nothing to report. The only Hermes setting this skill
