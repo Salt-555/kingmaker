@@ -9,15 +9,6 @@ script: no model runs on a tick, so checking costs nothing, and a healthy tick i
 
 ## Install
 
-As a Hermes skill tap:
-
-```
-hermes skills tap add Salt-555/kingmaker
-hermes skills install Salt-555/kingmaker/kingmaker
-```
-
-Or install just this skill without subscribing to the tap:
-
 ```
 hermes skills install Salt-555/kingmaker/skills/kingmaker
 ```
